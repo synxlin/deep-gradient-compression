@@ -1,0 +1,111 @@
+diff --git a/horovod/torch/compression.py b/horovod/torch/compression.py
+index 75ce91e..ca160ce 100644
+--- a/horovod/torch/compression.py
++++ b/horovod/torch/compression.py
+@@ -20,7 +20,7 @@ import torch
+ class Compressor(object):
+     """Interface for compressing and decompressing a given tensor."""
+     @staticmethod
+-    def compress(tensor):
++    def compress(tensor, name=None):
+         """Compresses a tensor and returns it with the context needed to decompress it."""
+         pass
+ 
+@@ -33,7 +33,7 @@ class Compressor(object):
+ class NoneCompressor(Compressor):
+     """Default no-op compression."""
+     @staticmethod
+-    def compress(tensor):
++    def compress(tensor, name=None):
+         """Returns the tensor unmodified."""
+         return tensor, None
+ 
+@@ -46,7 +46,7 @@ class NoneCompressor(Compressor):
+ class FP16Compressor(Compressor):
+     """Compress all floating point gradients to 16-bit."""
+     @staticmethod
+-    def compress(tensor):
++    def compress(tensor, name=None):
+         """Downcasts the tensor to 16-bit."""
+         tensor_compressed = tensor
+         if tensor.dtype.is_floating_point:
+diff --git a/horovod/torch/optimizer.py b/horovod/torch/optimizer.py
+index c8def4b..d954146 100644
+--- a/horovod/torch/optimizer.py
++++ b/horovod/torch/optimizer.py
+@@ -23,7 +23,7 @@ import torch
+ 
+ from horovod.torch.compression import Compression
+ from horovod.torch.mpi_ops import allreduce_async_
+-from horovod.torch.mpi_ops import synchronize
++from horovod.torch.mpi_ops import synchronize as synchronize_
+ from horovod.torch.mpi_ops import size
+ from horovod.torch.mpi_ops import Average, Adasum
+ 
+@@ -33,6 +33,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
+                  backward_passes_per_step=1, op=Average):
+         super(self.__class__, self).__init__(params)
+         self._compression = compression
++        self._communicate_ = getattr(self._compression, 'communicate', allreduce_async_)
++        self._synchronize_ = getattr(self._compression, 'synchronize', synchronize_)
+ 
+         if named_parameters is not None:
+             named_parameters = list(named_parameters)
+@@ -111,9 +113,9 @@ class _DistributedOptimizer(torch.optim.Optimizer):
+     def _allreduce_grad_async(self, p):
+         name = self._parameter_names.get(p)
+         tensor = p.grad
+-        tensor_compressed, ctx = self._compression.compress(tensor)
++        tensor_compressed, ctx = self._compression.compress(tensor, name)
+ 
+-        handle = allreduce_async_(tensor_compressed, name=name, op=self.op)
++        handle = self._communicate_(tensor_compressed, name=name, op=self.op)
+         return handle, ctx
+ 
+     def _make_hook(self, p):
+@@ -140,13 +142,12 @@ class _DistributedOptimizer(torch.optim.Optimizer):
+             handle, ctx = self._allreduce_grad_async(p)
+             self._handles[p] = (handle, ctx)
+ 
+-        for p, value in self._handles.items():
+-            handle, ctx = value
++        for p, (handle, ctx) in self._handles.items():
+             if handle is None:
+                 handle, ctx = self._allreduce_grad_async(p)
+                 self._handles[p] = (handle, ctx)
+-        for p, (handle, _) in self._handles.items():
+-            output = synchronize(handle)
++        for p, (handle, ctx) in self._handles.items():
++            output = self._synchronize_(handle)
+             self._allreduce_delay[p] = self.backward_passes_per_step
+             p.grad.set_(self._compression.decompress(output, ctx))
+         self._handles.clear()
+@@ -200,6 +201,8 @@ class _DistributedAdasumOptimizer(torch.optim.Optimizer):
+         super(self.__class__, self).__init__(params)
+ 
+         self._compression = compression
++        self._communicate_ = getattr(self._compression, 'communicate', allreduce_async_)
++        self._synchronize_ = getattr(self._compression, 'synchronize', synchronize_)
+ 
+         if named_parameters is not None:
+             named_parameters = list(named_parameters)
+@@ -298,8 +301,8 @@ class _DistributedAdasumOptimizer(torch.optim.Optimizer):
+         p.data.sub_(start)
+ 
+         # allreduce as before
+-        tensor_compressed, ctx = self._compression.compress(p)
+-        handle = allreduce_async_(tensor_compressed.data, name=name, op=Adasum)
++        tensor_compressed, ctx = self._compression.compress(p, name)
++        handle = self._communicate_(tensor_compressed.data, name=name, op=Adasum)
+ 
+         # reset stashed parameters
+         for stashed, group in zip(stashed_params, self.param_groups):
+@@ -348,7 +351,7 @@ class _DistributedAdasumOptimizer(torch.optim.Optimizer):
+             if not handle:
+                 handle, ctx = self._allreduce_grad_async(p)
+                 self._handles[p] = (handle, ctx)
+-            delta = synchronize(handle)
++            delta = self._synchronize_(handle)
+             delta = self._compression.decompress(delta, ctx)
+             start = self._starting_models[p]
+             start.data.add_(delta.data)
